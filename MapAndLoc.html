@@ -991,7 +991,16 @@
         return clamp(100 - riskScore, 0, 100);
     }
 
-    function evaluateRouteCandidate(routeCoords, routeIndex) {
+    function formatDistanceKm(distanceKm) {
+
+        if (distanceKm >= 10) {
+            return distanceKm.toFixed(1) + " km";
+        }
+
+        return distanceKm.toFixed(2) + " km";
+    }
+
+    function evaluateRouteCandidate(routeCoords, routeIndex, routeDistanceMeters) {
 
         const segments = splitRouteIntoSegments(routeCoords, 8);
 
@@ -1037,6 +1046,7 @@
             routeNumber: routeIndex + 1,
             aggregateSafetyScore: Number(aggregateSafetyScore.toFixed(1)),
             aggregateDangerIndex: Number(aggregateDangerIndex.toFixed(1)),
+            distanceKm: Number((routeDistanceMeters / 1000).toFixed(2)),
             segmentCount: segmentAnalyses.length,
             averageFeatures: {
                 proximityRisk: Number(averageFeatureValues.proximityRisk.toFixed(1)),
@@ -1064,7 +1074,8 @@
             const meta = document.createElement("div");
             meta.className = "route-row-meta";
             meta.textContent =
-                "Segments: " + candidate.segmentCount +
+                "Distance: " + formatDistanceKm(candidate.distanceKm) +
+                " | Segments: " + candidate.segmentCount +
                 " | Danger: " + candidate.aggregateDangerIndex +
                 " | Proximity: " + candidate.averageFeatures.proximityRisk +
                 " | Severity: " + candidate.averageFeatures.severityRisk;
@@ -1195,7 +1206,10 @@
                 const candidates = features.map((feature, index) => {
                     const coords = feature.geometry.coordinates;
                     const routeCoords = coords.map(coord => [coord[1], coord[0]]);
-                    const evaluation = evaluateRouteCandidate(routeCoords, index);
+                    const routeDistanceMeters = feature.properties && feature.properties.summary
+                        ? feature.properties.summary.distance
+                        : getRouteLength(routeCoords) * 111000;
+                    const evaluation = evaluateRouteCandidate(routeCoords, index, routeDistanceMeters);
 
                     return {
                         ...evaluation,
