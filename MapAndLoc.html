@@ -336,6 +336,40 @@
             font-weight: 700;
         }
 
+        .routes-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .route-row {
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 14px;
+            background: rgba(7, 16, 30, 0.55);
+            padding: 10px 12px;
+        }
+
+        .route-row.active {
+            border-color: rgba(125, 211, 252, 0.55);
+            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.14);
+        }
+
+        .route-row-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 4px;
+            font-size: 13px;
+            font-weight: 700;
+            color: #e6f2ff;
+        }
+
+        .route-row-meta {
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
         .legend-item {
             display: flex;
             align-items: center;
@@ -546,6 +580,16 @@
                     <span>Higher weighted incident score</span>
                 </div>
             </div>
+
+            <div class="legend-card">
+                <h3>Candidate Routes</h3>
+                <div id="routes-list" class="routes-list">
+                    <div class="route-row">
+                        <div class="route-row-title">No candidates yet</div>
+                        <div class="route-row-meta">Run a search to generate and score multiple route options.</div>
+                    </div>
+                </div>
+            </div>
         </aside>
 
         <section class="panel map-panel">
@@ -628,7 +672,7 @@
 
     // ---------------- ROUTE VARIABLES ----------------
 
-    let currentRoute = null;
+    let currentRoutes = [];
 
     const statusChip = document.getElementById("status-chip");
     const statusTitle = document.getElementById("status-title");
@@ -639,6 +683,8 @@
     const riskNote = document.getElementById("risk-note");
     const searchSummary = document.getElementById("search-summary");
     const routeButton = document.getElementById("find-route");
+    const routesList = document.getElementById("routes-list");
+    const MAX_DISPLAY_ROUTES = 2;
 
     function setStatus(type, title, message) {
 
@@ -692,6 +738,343 @@
         };
     }
 
+    function clearRouteLayers() {
+
+        currentRoutes.forEach(routeLayer => {
+            map.removeLayer(routeLayer);
+        });
+
+        currentRoutes = [];
+    }
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function pickRouteColor(displayRank) {
+
+        if (displayRank === 1) {
+            return "#4ade80";
+        }
+
+        if (displayRank === 2) {
+            return "#fbbf24";
+        }
+
+        return "#fbbf24";
+    }
+
+    function getBandDetailsByScore(score) {
+
+        if (score >= 70) {
+            return {
+                label: "Safe",
+                status: "safe",
+                note: "This route has strong safety indicators across most segments."
+            };
+        }
+
+        if (score >= 45) {
+            return {
+                label: "Moderate",
+                status: "moderate",
+                note: "This route mixes safe and cautionary segments."
+            };
+        }
+
+        return {
+            label: "Danger",
+            status: "danger",
+            note: "This route contains multiple high-risk segments."
+        };
+    }
+
+    function splitRouteIntoSegments(routeCoords, targetSegments = 8) {
+
+        const minimumPointsPerSegment = 6;
+        const segmentCount = Math.max(1, Math.min(targetSegments, Math.floor(routeCoords.length / minimumPointsPerSegment)));
+
+        if (segmentCount <= 1) {
+            return [routeCoords];
+        }
+
+        const segments = [];
+        const segmentSize = Math.ceil(routeCoords.length / segmentCount);
+
+        for (let i = 0; i < routeCoords.length; i += segmentSize) {
+            const segment = routeCoords.slice(i, i + segmentSize);
+            if (segment.length > 1) {
+                segments.push(segment);
+            }
+        }
+
+        return segments;
+    }
+
+    function getPointAlongRoute(routeCoords, ratio) {
+
+        if (!routeCoords || routeCoords.length === 0) {
+            return null;
+        }
+
+        const index = Math.floor(clamp(ratio, 0, 1) * (routeCoords.length - 1));
+        return routeCoords[index];
+    }
+
+    function downsampleRoute(routeCoords, sampleCount = 24) {
+
+        if (!routeCoords || routeCoords.length === 0) {
+            return [];
+        }
+
+        if (routeCoords.length <= sampleCount) {
+            return routeCoords;
+        }
+
+        const sampled = [];
+
+        for (let i = 0; i < sampleCount; i++) {
+            const ratio = i / (sampleCount - 1);
+            const index = Math.floor(ratio * (routeCoords.length - 1));
+            sampled.push(routeCoords[index]);
+        }
+
+        return sampled;
+    }
+
+    function getRouteLength(routeCoords) {
+
+        let length = 0;
+
+        for (let i = 1; i < routeCoords.length; i++) {
+            const prev = routeCoords[i - 1];
+            const curr = routeCoords[i];
+            const dLat = curr[0] - prev[0];
+            const dLng = curr[1] - prev[1];
+            length += Math.sqrt((dLat * dLat) + (dLng * dLng));
+        }
+
+        return length;
+    }
+
+    function areRoutesNearDuplicate(routeA, routeB) {
+
+        const sampledA = downsampleRoute(routeA, 24);
+        const sampledB = downsampleRoute(routeB, 24);
+
+        const pointsToCompare = Math.min(sampledA.length, sampledB.length);
+        if (pointsToCompare === 0) {
+            return false;
+        }
+
+        let distanceSum = 0;
+        for (let i = 0; i < pointsToCompare; i++) {
+            const a = sampledA[i];
+            const b = sampledB[i];
+            const dLat = a[0] - b[0];
+            const dLng = a[1] - b[1];
+            distanceSum += Math.sqrt((dLat * dLat) + (dLng * dLng));
+        }
+
+        const avgPointDistance = distanceSum / pointsToCompare;
+
+        const lengthA = getRouteLength(routeA);
+        const lengthB = getRouteLength(routeB);
+        const maxLength = Math.max(lengthA, lengthB, 0.00001);
+        const lengthDifferenceRatio = Math.abs(lengthA - lengthB) / maxLength;
+
+        return avgPointDistance < 0.0018 && lengthDifferenceRatio < 0.06;
+    }
+
+    function selectDistinctTopCandidates(sortedCandidates, maxCount) {
+
+        const distinct = [];
+
+        for (const candidate of sortedCandidates) {
+            const isDuplicate = distinct.some(existing => {
+                return areRoutesNearDuplicate(existing.routeCoords, candidate.routeCoords);
+            });
+
+            if (!isDuplicate) {
+                distinct.push(candidate);
+            }
+
+            if (distinct.length === maxCount) {
+                break;
+            }
+        }
+
+        return distinct.map((candidate, index) => ({
+            ...candidate,
+            displayRank: index + 1
+        }));
+    }
+
+    function calculateSegmentDistance(segmentCoords) {
+
+        let length = 0;
+
+        for (let i = 1; i < segmentCoords.length; i++) {
+            const prev = segmentCoords[i - 1];
+            const curr = segmentCoords[i];
+
+            const dLat = curr[0] - prev[0];
+            const dLng = curr[1] - prev[1];
+            length += Math.sqrt((dLat * dLat) + (dLng * dLng));
+        }
+
+        return length;
+    }
+
+    function extractSegmentSafetyFeatures(segmentCoords) {
+
+        let proximityWeighted = 0;
+        let nearbyCount = 0;
+        let severeNearbyCount = 0;
+        let nearestDistanceAccumulator = 0;
+
+        segmentCoords.forEach(coord => {
+            const lat = coord[0];
+            const lng = coord[1];
+
+            let nearestDistance = Infinity;
+
+            data.forEach(point => {
+                const crimeLat = point.longi;
+                const crimeLng = point.lati;
+
+                const distance = Math.sqrt(
+                    Math.pow(lat - crimeLat, 2) +
+                    Math.pow(lng - crimeLng, 2)
+                );
+
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                }
+
+                if (distance < 0.015) {
+                    const distanceWeight = 1 - (distance / 0.015);
+                    proximityWeighted += point.properties.mag * distanceWeight;
+                }
+
+                if (distance < 0.03) {
+                    nearbyCount += 1;
+                }
+
+                if (point.properties.mag >= 3 && distance < 0.02) {
+                    severeNearbyCount += 1;
+                }
+            });
+
+            nearestDistanceAccumulator += nearestDistance === Infinity ? 0.05 : nearestDistance;
+        });
+
+        const avgNearestDistance = nearestDistanceAccumulator / segmentCoords.length;
+        const clearanceSafety = clamp((avgNearestDistance / 0.04) * 100, 0, 100);
+
+        return {
+            proximityRisk: clamp(proximityWeighted * 12, 0, 100),
+            densityRisk: clamp(nearbyCount * 4, 0, 100),
+            severityRisk: clamp(severeNearbyCount * 20, 0, 100),
+            clearanceSafety: clearanceSafety
+        };
+    }
+
+    function scoreSegment(features) {
+
+        const riskScore =
+            (0.40 * features.proximityRisk) +
+            (0.25 * features.densityRisk) +
+            (0.25 * features.severityRisk) +
+            (0.10 * (100 - features.clearanceSafety));
+
+        return clamp(100 - riskScore, 0, 100);
+    }
+
+    function evaluateRouteCandidate(routeCoords, routeIndex) {
+
+        const segments = splitRouteIntoSegments(routeCoords, 8);
+
+        const segmentAnalyses = segments.map(segmentCoords => {
+            const features = extractSegmentSafetyFeatures(segmentCoords);
+            const safetyScore = scoreSegment(features);
+            const segmentDistance = calculateSegmentDistance(segmentCoords);
+
+            return {
+                features: features,
+                safetyScore: safetyScore,
+                distance: segmentDistance
+            };
+        });
+
+        const totalDistance = segmentAnalyses.reduce((sum, segment) => sum + segment.distance, 0) || 1;
+        const aggregateSafetyScore = segmentAnalyses.reduce((sum, segment) => {
+            return sum + (segment.safetyScore * (segment.distance / totalDistance));
+        }, 0);
+
+        const aggregateDangerIndex = clamp(100 - aggregateSafetyScore, 0, 100);
+
+        const averageFeatureValues = segmentAnalyses.reduce((accumulator, segment) => {
+            accumulator.proximityRisk += segment.features.proximityRisk;
+            accumulator.densityRisk += segment.features.densityRisk;
+            accumulator.severityRisk += segment.features.severityRisk;
+            accumulator.clearanceSafety += segment.features.clearanceSafety;
+            return accumulator;
+        }, {
+            proximityRisk: 0,
+            densityRisk: 0,
+            severityRisk: 0,
+            clearanceSafety: 0
+        });
+
+        const segmentCount = segmentAnalyses.length || 1;
+        averageFeatureValues.proximityRisk /= segmentCount;
+        averageFeatureValues.densityRisk /= segmentCount;
+        averageFeatureValues.severityRisk /= segmentCount;
+        averageFeatureValues.clearanceSafety /= segmentCount;
+
+        return {
+            routeNumber: routeIndex + 1,
+            aggregateSafetyScore: Number(aggregateSafetyScore.toFixed(1)),
+            aggregateDangerIndex: Number(aggregateDangerIndex.toFixed(1)),
+            segmentCount: segmentAnalyses.length,
+            averageFeatures: {
+                proximityRisk: Number(averageFeatureValues.proximityRisk.toFixed(1)),
+                densityRisk: Number(averageFeatureValues.densityRisk.toFixed(1)),
+                severityRisk: Number(averageFeatureValues.severityRisk.toFixed(1)),
+                clearanceSafety: Number(averageFeatureValues.clearanceSafety.toFixed(1))
+            }
+        };
+    }
+
+    function renderRouteCandidates(candidates, bestDisplayRank) {
+
+        routesList.innerHTML = "";
+
+        candidates.forEach(candidate => {
+
+            const row = document.createElement("div");
+            row.className = "route-row" + (candidate.displayRank === bestDisplayRank ? " active" : "");
+
+            const title = document.createElement("div");
+            title.className = "route-row-title";
+            title.innerHTML = "<span>Route " + candidate.displayRank + "</span>" +
+                "<span>Safety " + candidate.aggregateSafetyScore + "/100</span>";
+
+            const meta = document.createElement("div");
+            meta.className = "route-row-meta";
+            meta.textContent =
+                "Segments: " + candidate.segmentCount +
+                " | Danger: " + candidate.aggregateDangerIndex +
+                " | Proximity: " + candidate.averageFeatures.proximityRisk +
+                " | Severity: " + candidate.averageFeatures.severityRisk;
+
+            row.appendChild(title);
+            row.appendChild(meta);
+            routesList.appendChild(row);
+        });
+    }
+
     // ---------------- SEARCH PLACE ----------------
 
     async function searchPlace(query) {
@@ -705,51 +1088,39 @@
 
     // ---------------- GET ROUTE ----------------
 
-    async function getRoute(start, end) {
+    async function getRouteCandidates(start, end) {
 
-        // Replace with YOUR OpenRouteService API Key
+        // Replace with your OpenRouteService API key if needed.
         const apiKey = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjVlNDhhNjg0MzNjYTQ4YTQ5ZGYwYTJiYzAzMWE5Y2Q4IiwiaCI6Im11cm11cjY0In0=";
 
         const response = await fetch(
-            "https://api.openrouteservice.org/v2/directions/driving-car?api_key=" + apiKey +
-            "&start=" + start.lon + "," + start.lat +
-            "&end=" + end.lon + "," + end.lat
+            "https://api.openrouteservice.org/v2/directions/driving-car/geojson",
+            {
+                method: "POST",
+                headers: {
+                    "Authorization": apiKey,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    coordinates: [
+                        [Number(start.lon), Number(start.lat)],
+                        [Number(end.lon), Number(end.lat)]
+                    ],
+                    alternative_routes: {
+                        target_count: 3,
+                        weight_factor: 1.6,
+                        share_factor: 0.6
+                    }
+                })
+            }
         );
 
-        return await response.json();
-    }
+        if (!response.ok) {
+            throw new Error("Alternative route request failed with status " + response.status);
+        }
 
-    // ---------------- CALCULATE DANGER ----------------
-
-    function calculateDanger(routeCoords) {
-
-        let dangerScore = 0;
-
-        routeCoords.forEach(coord => {
-
-            const lat = coord[0];
-            const lng = coord[1];
-
-            data.forEach(point => {
-
-                const crimeLat = point.longi;
-                const crimeLng = point.lati;
-
-                const distance =
-                    Math.sqrt(
-                        Math.pow(lat - crimeLat, 2) +
-                        Math.pow(lng - crimeLng, 2)
-                    );
-
-                if (distance < 0.02) {
-                    dangerScore += point.properties.mag;
-                }
-
-            });
-
-        });
-
-        return dangerScore;
+        const data = await response.json();
+        return data.features || [];
     }
 
     // ---------------- FIND ROUTE BUTTON ----------------
@@ -800,15 +1171,15 @@
                 setStatus(
                     "loading",
                     "Building route",
-                    "Locations found. Calculating the best available driving route now."
+                    "Locations found. Generating and scoring route candidates now."
                 );
 
                 const start = startResults[0];
                 const end = endResults[0];
 
-                const routeData = await getRoute(start, end);
+                const features = await getRouteCandidates(start, end);
 
-                if (!routeData.features || routeData.features.length === 0) {
+                if (!features || features.length === 0) {
                     setStatus(
                         "error",
                         "Route unavailable",
@@ -819,34 +1190,96 @@
                     return;
                 }
 
-                const coords = routeData.features[0].geometry.coordinates;
-                const routeCoords = coords.map(coord => [coord[1], coord[0]]);
+                clearRouteLayers();
 
-                if (currentRoute) {
-                    map.removeLayer(currentRoute);
+                const candidates = features.map((feature, index) => {
+                    const coords = feature.geometry.coordinates;
+                    const routeCoords = coords.map(coord => [coord[1], coord[0]]);
+                    const evaluation = evaluateRouteCandidate(routeCoords, index);
+
+                    return {
+                        ...evaluation,
+                        routeCoords: routeCoords
+                    };
+                });
+
+                candidates.sort((a, b) => b.aggregateSafetyScore - a.aggregateSafetyScore);
+
+                const displayedCandidates = selectDistinctTopCandidates(candidates, MAX_DISPLAY_ROUTES);
+
+                if (displayedCandidates.length === 0) {
+                    throw new Error("No distinct route candidates available to display.");
                 }
 
-                const danger = calculateDanger(routeCoords);
-                const risk = getRiskDetails(danger);
+                const best = displayedCandidates[0];
 
-                currentRoute = L.polyline(
-                    routeCoords,
-                    {
-                        color: risk.color,
-                        weight: 6,
-                        opacity: 0.9
+                const bounds = [];
+                displayedCandidates.forEach(candidate => {
+                    const isBest = candidate.displayRank === 1;
+                    const routeColor = pickRouteColor(candidate.displayRank);
+
+                    const routeLayer = L.polyline(
+                        candidate.routeCoords,
+                        {
+                            color: routeColor,
+                            weight: isBest ? 7 : 4,
+                            opacity: isBest ? 0.95 : 0.62
+                        }
+                    ).addTo(map);
+
+                    currentRoutes.push(routeLayer);
+
+                    // Add a route badge so each candidate remains visible even when paths overlap.
+                    const markerPoint = getPointAlongRoute(candidate.routeCoords, 0.45);
+                    if (markerPoint) {
+                        const routeOffset = candidate.displayRank * 0.00018;
+                        const badgeLatLng = [markerPoint[0] + routeOffset, markerPoint[1] - routeOffset];
+
+                        const badge = L.marker(badgeLatLng, {
+                            icon: L.divIcon({
+                                className: "",
+                                html:
+                                    '<div style="' +
+                                    'padding:2px 7px;' +
+                                    'border-radius:999px;' +
+                                    'font-size:11px;' +
+                                    'font-weight:800;' +
+                                    'letter-spacing:0.02em;' +
+                                    'background:' + routeColor + ';' +
+                                    'color:#07111f;' +
+                                    'border:1px solid rgba(7,17,31,0.45);' +
+                                    'box-shadow:0 4px 14px rgba(0,0,0,0.35);' +
+                                    '">R' + candidate.displayRank + '</div>',
+                                iconSize: [34, 20],
+                                iconAnchor: [17, 10]
+                            })
+                        }).addTo(map);
+
+                        currentRoutes.push(badge);
                     }
-                ).addTo(map);
 
-                map.fitBounds(currentRoute.getBounds(), { padding: [30, 30] });
+                    bounds.push(...candidate.routeCoords);
+                });
+
+                if (bounds.length > 0) {
+                    map.fitBounds(L.latLngBounds(bounds), { padding: [30, 30] });
+                }
+
+                const bestBand = getBandDetailsByScore(best.aggregateSafetyScore);
+
+                renderRouteCandidates(displayedCandidates, best.displayRank);
 
                 setStatus(
-                    risk.status,
-                    risk.label + " route identified",
-                    "Route analysis complete. Review the score and map overlay for the latest result."
+                    bestBand.status,
+                    bestBand.label + " route selected",
+                    "Generated " + displayedCandidates.length + " candidates, segmented each route, and ranked them using a multi-parameter safety model."
                 );
-                setMetrics(danger, risk.label, risk.note);
-                searchSummary.textContent = origin + " to " + destination + " analyzed with a " + risk.label.toLowerCase() + " risk profile.";
+                setMetrics(best.aggregateDangerIndex, bestBand.label, bestBand.note);
+                searchSummary.textContent =
+                    origin + " to " + destination +
+                    " analyzed across " + displayedCandidates.length +
+                    " routes. Best option: Route " + best.displayRank +
+                    " (Safety " + best.aggregateSafetyScore + "/100).";
 
             } catch (error) {
 
